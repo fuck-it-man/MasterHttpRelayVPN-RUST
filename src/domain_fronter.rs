@@ -9,7 +9,8 @@
 //! TODO: add HTTP/2 multiplexing (`h2` crate) for lower latency.
 //! TODO: add parallel range-based downloads.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -69,6 +70,8 @@ pub struct DomainFronter {
     tls_connector: TlsConnector,
     pool: Arc<Mutex<Vec<PoolEntry>>>,
     cache: Arc<ResponseCache>,
+    inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
+    coalesced: AtomicU64,
 }
 
 /// Request payload sent to Apps Script (single, non-batch).
@@ -129,11 +132,17 @@ impl DomainFronter {
             tls_connector,
             pool: Arc::new(Mutex::new(Vec::new())),
             cache: Arc::new(ResponseCache::with_default()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            coalesced: AtomicU64::new(0),
         })
     }
 
     pub fn cache(&self) -> &ResponseCache {
         &self.cache
+    }
+
+    pub fn coalesced_count(&self) -> u64 {
+        self.coalesced.load(Ordering::Relaxed)
     }
 
     fn next_script_id(&self) -> &str {
@@ -187,8 +196,9 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
-        let cacheable = is_cacheable_method(method) && body.is_empty();
-        let key = if cacheable { Some(cache_key(method, url)) } else { None };
+        let coalescible = is_cacheable_method(method) && body.is_empty();
+        let key = if coalescible { Some(cache_key(method, url)) } else { None };
+
         if let Some(ref k) = key {
             if let Some(hit) = self.cache.get(k) {
                 tracing::debug!("cache hit: {}", url);
@@ -196,6 +206,54 @@ impl DomainFronter {
             }
         }
 
+        // Coalesce concurrent identical requests: only the first caller actually
+        // hits the relay; waiters subscribe to the same broadcast channel.
+        let waiter = if let Some(ref k) = key {
+            let mut inflight = self.inflight.lock().await;
+            match inflight.get(k) {
+                Some(tx) => {
+                    let rx = tx.subscribe();
+                    self.coalesced.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("coalesced: {}", url);
+                    Some(rx)
+                }
+                None => {
+                    let (tx, _) = broadcast::channel(1);
+                    inflight.insert(k.clone(), tx);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(mut rx) = waiter {
+            match rx.recv().await {
+                Ok(bytes) => return bytes,
+                Err(_) => return error_response(502, "coalesced request dropped"),
+            }
+        }
+
+        let bytes = self.relay_uncoalesced(method, url, headers, body, key.as_deref()).await;
+
+        if let Some(ref k) = key {
+            let mut inflight = self.inflight.lock().await;
+            if let Some(tx) = inflight.remove(k) {
+                let _ = tx.send(bytes.clone());
+            }
+        }
+
+        bytes
+    }
+
+    async fn relay_uncoalesced(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        cache_key_opt: Option<&str>,
+    ) -> Vec<u8> {
         let bytes = match timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
             self.do_relay_with_retry(method, url, headers, body),
@@ -213,10 +271,10 @@ impl DomainFronter {
             }
         };
 
-        if let Some(k) = key {
+        if let Some(k) = cache_key_opt {
             if let Some(ttl) = parse_ttl(&bytes, url) {
                 tracing::debug!("cache store: {} ttl={}s", url, ttl.as_secs());
-                self.cache.put(k, bytes.clone(), ttl);
+                self.cache.put(k.to_string(), bytes.clone(), ttl);
             }
         }
         bytes
