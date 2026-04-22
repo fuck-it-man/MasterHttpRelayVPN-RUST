@@ -174,6 +174,32 @@ Then:
 
 `script_id` can also be a JSON array: `["id1", "id2", "id3"]`.
 
+#### scan-ips configuration (optional)
+
+By default, the scan-ips subcommand uses a static array of IPs.
+
+You can enable dynamic IP discovery by setting fetch_ips_from_api to true in config.json:
+
+```json
+{
+  "fetch_ips_from_api": true,
+  "max_ips_to_scan": 100,
+  "scan_batch_size":100,
+  "google_ip_validation": true // check whether ips belongs to frontend sites of google or not
+}
+```
+
+When enabled:
+
+- Fetches goog.json from Google’s public IP ranges API
+- Extracts all CIDRs and expands them to individual IPs
+- Prioritizes IPs from famous Google domains (google.com, youtube.com, etc.)
+- Randomly selects up to max_ips_to_scan candidates (prioritized IPs first)
+- Tests only the selected candidates for connectivity and frontend validation.
+
+By using this options you may find ips witch are faster than static array that is provided as default but there is no guarantee that this ips would work.
+
+
 ### Step 5 — Point your client at the proxy
 
 The tool listens on **two** ports. Use whichever your client supports:
@@ -423,6 +449,32 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 
 **فایرفاکس (ساده‌ترین):**
 
+
+#### پیکربندی scan-ips (اختیاری)
+به‌طور پیش‌فرض، دستور scan-ips از آرایه‌ای ثابت از IPها استفاده می‌کند.
+
+می‌توانید کشف پویای IP را با تنظیم fetch_ips_from_api روی true در config.json فعال کنید:
+
+```json
+{
+  "fetch_ips_from_api": true,
+  "max_ips_to_scan": 100,
+  "scan_batch_size":100,
+  "google_ip_validation": true // برسی هدر های بازگشته از ایپی برای برسی هدر ها و تشخیص کاربردی بودن ایپی
+}
+```
+
+زمانی که فعال باشد:
+
+- فایل goog.json را از API محدوده‌های عمومی IP گوگل دریافت می‌کند
+تمام CIDRها را استخراج کرده و به IPهای جداگانه تبدیل می‌کند
+- به IPهای دامنه‌های معروف گوگل (google.com، youtube.com و غیره) اولویت می‌دهد
+به‌صورت تصادفی تا max_ips_to_scan کاندید انتخاب می‌کند (ابتدا IPهای اولویت‌دار)
+فقط کاندیدهای انتخاب‌شده را برای اتصال و اعتبارسنجی frontend تست می‌کند.
+
+با استفاده از این گزینه‌ها ممکن است IPهایی پیدا کنید که سریع‌تر از آرایه ثابت پیش‌فرض هستند اما تضمینی وجود ندارد که این IPها کار کنند.
+
+#### ۵. تنظیم proxy در کلاینت
 ۱. منوی `Settings` را باز کنید، در خانهٔ جست‌وجو عبارت `proxy` را تایپ کنید
 ۲. روی **`Network Settings`** کلیک کنید
 ۳. گزینهٔ **`Manual proxy configuration`** را انتخاب کنید

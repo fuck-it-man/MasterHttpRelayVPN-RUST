@@ -80,7 +80,23 @@ pub struct Config {
     /// various times). Can be tested per-name via the UI or `mhrv-rs test-sni`.
     #[serde(default)]
     pub sni_hosts: Option<Vec<String>>,
+    #[serde(default = "default_fetch_ips_from_api")]
+    pub fetch_ips_from_api: bool,
+
+    #[serde(default = "default_max_ips_to_scan")]
+    pub max_ips_to_scan: usize,
+
+    #[serde(default = "default_scan_batch_size")]
+    pub scan_batch_size:usize,
+
+    #[serde(default = "default_google_ip_validation")]
+    pub google_ip_validation: bool
 }
+
+fn default_fetch_ips_from_api() -> bool { false }
+fn default_max_ips_to_scan() -> usize { 100 }
+fn default_scan_batch_size() -> usize {500}
+fn default_google_ip_validation() -> bool {true}
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
