@@ -46,8 +46,10 @@ import com.therealaleph.mhrv.ui.theme.ErrRed
 import com.therealaleph.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /**
@@ -122,18 +124,31 @@ fun HomeScreen(
         }
     }
 
-    // Cooldown on Start/Stop. Rapid taps during a VPN transition trigger
-    // an emulator-specific EGL renderer crash
-    // (F OpenGLRenderer: EGL_NOT_INITIALIZED during rendering) — the
-    // service survives, but the Compose UI process dies and the app
-    // appears to close. On real hardware this is rare, but debouncing
-    // is useful UX anyway: neither start nor stop is truly instant,
-    // and the user gets no feedback if they tap while one is in flight.
-    var transitionCooldown by remember { mutableStateOf(false) }
-    LaunchedEffect(transitionCooldown) {
-        if (transitionCooldown) {
-            delay(2000)
-            transitionCooldown = false
+    // Gate Start/Stop on the service's actual state transition rather
+    // than a fixed timer. The previous 2s cooldown was shorter than the
+    // worst-case teardown (Tun2proxy.stop + 4s join + 5s rt.shutdown_timeout
+    // ≈ 9s on the slowest path), which let the user fire a fresh Connect
+    // while the previous Stop's native cleanup was still releasing the
+    // listener port — the new startProxy then failed with "Address already
+    // in use".
+    //
+    // `awaitingRunning` holds the value we expect VpnState.isRunning to
+    // settle on after the user's action; null means "no transition in
+    // flight". The LaunchedEffect below suspends on the StateFlow until
+    // the predicate matches, with a 12s backstop in case the service
+    // failed before flipping the flag (e.g., establish() returned null).
+    // Side benefit: this also debounces the rapid-tap EGL renderer crash
+    // the old timer was guarding against.
+    var awaitingRunning by remember { mutableStateOf<Boolean?>(null) }
+    val transitioning = awaitingRunning != null
+    LaunchedEffect(awaitingRunning) {
+        val target = awaitingRunning ?: return@LaunchedEffect
+        try {
+            withTimeoutOrNull(12_000) {
+                VpnState.isRunning.first { it == target }
+            }
+        } finally {
+            awaitingRunning = null
         }
     }
 
@@ -373,10 +388,11 @@ fun HomeScreen(
             val isVpnRunning by VpnState.isRunning.collectAsState()
             Button(
                 onClick = {
-                    transitionCooldown = true
                     if (isVpnRunning) {
+                        awaitingRunning = false
                         onStop()
                     } else {
+                        awaitingRunning = true
                         // Connect flow: auto-resolve google_ip so we don't
                         // hand the proxy a stale anycast target; repair
                         // front_domain if it got corrupted into an IP
@@ -418,7 +434,7 @@ fun HomeScreen(
                 },
                 enabled = (isVpnRunning ||
                     cfg.mode == Mode.GOOGLE_ONLY ||
-                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitionCooldown,
+                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
                     contentColor = androidx.compose.ui.graphics.Color.White,
@@ -430,7 +446,7 @@ fun HomeScreen(
             ) {
                 Text(
                     when {
-                        transitionCooldown -> "…"
+                        transitioning -> "…"
                         isVpnRunning -> stringResource(R.string.btn_disconnect)
                         else -> stringResource(R.string.btn_connect)
                     },

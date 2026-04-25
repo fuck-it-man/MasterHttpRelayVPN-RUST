@@ -242,13 +242,14 @@ class MhrvVpnService : VpnService() {
         tun = parcelFd
 
         // 3) Start tun2proxy on a worker thread. It blocks until stop() or
-        //    shutdown. We detach the fd so ownership transfers cleanly; the
-        //    ParcelFileDescriptor (`tun`) still holds a reference, so closing
-        //    it at teardown reliably tears down the TUN even if tun2proxy
-        //    doesn't cleanly exit.
+        //    shutdown. We detach the fd so ownership transfers cleanly to
+        //    tun2proxy (closeFdOnDrop = true closes it on return from run()).
+        //    The ParcelFileDescriptor (`tun`) we keep is post-detach — its
+        //    own close() is a no-op for the underlying fd, so the worker is
+        //    the sole owner once it's running.
         val detachedFd = parcelFd.detachFd()
         tun2proxyRunning.set(true)
-        tun2proxyThread = Thread({
+        val worker = Thread({
             try {
                 val rc = Tun2proxy.run(
                     "socks5://127.0.0.1:$socks5Port",
@@ -264,7 +265,29 @@ class MhrvVpnService : VpnService() {
             } finally {
                 tun2proxyRunning.set(false)
             }
-        }, "tun2proxy").apply { start() }
+        }, "tun2proxy")
+        try {
+            worker.start()
+            tun2proxyThread = worker
+        } catch (t: Throwable) {
+            // Thread.start can throw OutOfMemoryError under extreme memory
+            // pressure. The fd we just detached has no owner — without an
+            // explicit close it leaks for the life of the process. Adopt
+            // it into a fresh ParcelFileDescriptor purely so we can call
+            // close() on it.
+            Log.e(TAG, "tun2proxy thread start failed: ${t.message}", t)
+            tun2proxyRunning.set(false)
+            try {
+                ParcelFileDescriptor.adoptFd(detachedFd).close()
+            } catch (closeErr: Throwable) {
+                Log.w(TAG, "adoptFd($detachedFd).close failed: ${closeErr.message}")
+            }
+            Native.stopProxy(proxyHandle)
+            proxyHandle = 0L
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            stopSelf()
+            return
+        }
 
         // (startForeground was already called at the top of this method
         // to satisfy Android 8+'s foreground-service contract — see the
@@ -291,12 +314,23 @@ class MhrvVpnService : VpnService() {
      * tun2proxy still forwarding packets into a half-dead Rust runtime
      * while the runtime is force-aborting its tasks — that's the scenario
      * that manifested as "Stop crashes the app" when there were in-flight
-     * relay requests piled up against a dead Apps Script deployment. The
-     * correct order is:
-     *   1. Signal tun2proxy to stop (cooperative).
-     *   2. Close the TUN fd — forces tun2proxy's read() to return EBADF.
-     *   3. Join the tun2proxy thread (now it really will exit).
-     *   4. Shut down the Rust proxy runtime (nothing left to forward to).
+     * relay requests piled up against a dead Apps Script deployment.
+     *
+     * Steps, with the bound on each one called out so a hung native call
+     * cannot stall the whole teardown thread:
+     *   1. Signal tun2proxy to stop (cooperative). Bounded by a 2s
+     *      side-thread join — if the JNI call hangs we proceed anyway.
+     *   2. Drop our `ParcelFileDescriptor` reference. Because we already
+     *      called detachFd() at startup, this is a no-op for the
+     *      underlying fd — the worker (closeFdOnDrop=true) owns it.
+     *      We keep the call only so the PROXY_ONLY / failed-establish
+     *      paths still null out the field cleanly.
+     *   3. Join the tun2proxy thread, bounded at 4s. If the worker is
+     *      stuck we log and move on — the runtime shutdown below will
+     *      knock the rest of the world over.
+     *   4. Shut down the Rust proxy runtime, bounded by `rt.shutdown_timeout`
+     *      on the Rust side (5s). This is the hard backstop: the listener
+     *      socket is released here regardless of what the worker is doing.
      */
     private fun teardown() {
         // Idempotency guard. Without this, onDestroy racing the
@@ -315,17 +349,29 @@ class MhrvVpnService : VpnService() {
             "(tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)",
         )
 
-        // 1. Cooperative stop signal.
+        // 1. Cooperative stop signal — bounded so a hung Rust call cannot
+        //    stall the entire teardown thread. We've never observed
+        //    Tun2proxy.stop() block in practice, but the contract isn't
+        //    documented as bounded and the rest of teardown already takes
+        //    care to be timeout-bounded; this closes the gap.
         if (tun2proxyRunning.get()) {
-            try { Tun2proxy.stop() } catch (t: Throwable) {
-                Log.w(TAG, "Tun2proxy.stop: ${t.message}")
+            val stopper = Thread({
+                try { Tun2proxy.stop() } catch (t: Throwable) {
+                    Log.w(TAG, "Tun2proxy.stop: ${t.message}")
+                }
+            }, "mhrv-tun2proxy-stop").apply { start() }
+            try { stopper.join(2_000) } catch (_: InterruptedException) {}
+            if (stopper.isAlive) {
+                Log.w(TAG, "Tun2proxy.stop did not return within 2s — proceeding")
             }
         }
 
-        // 2. Close the TUN fd. Since we called detachFd earlier the
-        //    ParcelFileDescriptor no longer owns the fd and close() here
-        //    is a no-op; the real fd is owned by tun2proxy (closeFdOnDrop
-        //    = true), which closes it on return from run().
+        // 2. Drop our PFD reference. detachFd at startup means this
+        //    close() is a no-op for the underlying fd — tun2proxy owns
+        //    it (closeFdOnDrop = true) and closes it on return from
+        //    run(). The call is kept only to null the field cleanly on
+        //    paths that never reached detachFd (PROXY_ONLY, or an
+        //    establish() that failed mid-builder).
         try { tun?.close() } catch (t: Throwable) {
             Log.w(TAG, "tun.close: ${t.message}")
         }

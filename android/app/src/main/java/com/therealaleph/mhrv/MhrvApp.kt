@@ -42,11 +42,18 @@ class MhrvApp : Application() {
         )
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            Log.e(
-                CRASH_TAG,
-                "uncaught on thread=${thread.name} (id=${thread.id}): ${throwable.message}",
-                throwable,
-            )
+            // Log.e itself can throw on extreme conditions (logd dead,
+            // OOM allocating the formatted message). If we let that
+            // bubble up, we'd recurse into our own handler with a
+            // half-handled original exception; swallow it so the
+            // previous handler still fires with the real failure.
+            try {
+                Log.e(
+                    CRASH_TAG,
+                    "uncaught on thread=${thread.name} (id=${thread.id}): ${throwable.message}",
+                    throwable,
+                )
+            } catch (_: Throwable) { }
             // Let the default handler still terminate the process and
             // show the system "app closed" dialog — we just wanted to
             // get a log line out the door first.
