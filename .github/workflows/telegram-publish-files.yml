@@ -99,12 +99,23 @@ jobs:
       - name: Publish files to Telegram channel
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          # The target channel — supergroup-style negative ID. Hard-coded
+          # The files channel — supergroup-style negative ID, hard-coded
           # rather than templated as a repo variable because there's only
           # ever one of these and putting it in source makes the workflow
-          # auditable. The bot token (`secrets.TELEGRAM_BOT_TOKEN`)
-          # already has post permissions on this channel.
+          # auditable. The bot token already has post permissions there.
           CHAT_ID: '-1003966234444'
+          # The main announcement channel. Receives a single cross-link
+          # message per release pointing at the file-channel anchor post,
+          # instead of the previous behaviour of attaching the universal
+          # APK + full changelog. Sourced from the same secret the
+          # legacy `telegram` job in release.yml used.
+          MAIN_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional: if the files channel later gets a public username,
+          # set the repo variable `FILES_CHANNEL_USERNAME` (without the
+          # `@`) so the cross-link uses the prettier `t.me/<name>/<msg>`
+          # form instead of `t.me/c/<id>/<msg>` (which only resolves for
+          # channel members).
+          FILES_CHANNEL_USERNAME: ${{ vars.FILES_CHANNEL_USERNAME }}
         run: |
           if [ -z "${BOT_TOKEN:-}" ]; then
             echo "::error::TELEGRAM_BOT_TOKEN not set; can't publish"

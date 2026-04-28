@@ -17,6 +17,7 @@ for the same version (the channel will get duplicate posts).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -193,6 +194,16 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def sha256_hex(path: Path) -> str:
+    """Stream-hash the file in 1 MiB chunks. Avoids loading 40+ MB APKs
+    into RAM twice (once for hashing, once for upload)."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def post_file(
     bot_token: str,
     chat_id: str,
@@ -201,12 +212,27 @@ def post_file(
     hashtag: str,
 ) -> bool:
     """Post one file. If too big, split + post each part. Returns True
-    on success of all parts, False on any failure."""
+    on success of all parts, False on any failure.
+
+    Each caption ends with the file's SHA-256 in hex under a Persian
+    "تایید اصالت" (authenticity verification) label, so recipients can
+    `sha256sum <file>` after download and confirm it matches what the
+    channel posted — defends against modified copies if the channel is
+    ever compromised or relayed through a third party."""
     size = file_path.stat().st_size
+
+    # Compute the original-file hash regardless of whether we'll chunk
+    # it. For chunked uploads, every part's caption shows this hash so
+    # the user can verify the full file once reassembled with `cat`.
+    print(f"  hashing {file_path.name}...", flush=True)
+    full_sha = sha256_hex(file_path)
+
     if size <= CHUNK_LIMIT_BYTES:
         caption = (
             f"<b>{html_escape(base_caption)}</b>\n"
             f"<code>{html_escape(file_path.name)}</code>\n"
+            f"\nتایید اصالت (SHA-256):\n"
+            f"<code>{full_sha}</code>\n"
             f"\n{hashtag}"
         )
         print(f"  uploading {file_path.name} ({size / 1_048_576:.1f} MB)...", flush=True)
@@ -241,12 +267,19 @@ def post_file(
     n = len(parts)
     all_ok = True
     for idx, part_path in enumerate(parts, start=1):
+        # Hash the individual part too — lets the user verify each
+        # downloaded chunk before bothering to reassemble.
+        part_sha = sha256_hex(part_path)
         part_caption = (
             f"<b>{html_escape(base_caption)} — قسمت {idx}/{n}</b>\n"
             f"<code>{html_escape(part_path.name)}</code>\n"
             f"\nبرای بازسازی فایل اصلی:\n"
             f"<code>cat {html_escape(file_path.name)}.part_* &gt; "
             f"{html_escape(file_path.name)}</code>\n"
+            f"\nتایید اصالت این قسمت (SHA-256):\n"
+            f"<code>{part_sha}</code>\n"
+            f"\nتایید اصالت فایل کامل پس از بازسازی (SHA-256):\n"
+            f"<code>{full_sha}</code>\n"
             f"\n{hashtag}"
         )
         psize = part_path.stat().st_size
@@ -279,6 +312,78 @@ def post_file(
                 pass
 
     return all_ok
+
+
+def files_channel_post_link(chat_id: str, message_id: int) -> str:
+    """Build a `t.me` link to a specific message in the files channel.
+
+    For private supergroups/channels (negative ID with `-100` prefix),
+    Telegram exposes posts at `https://t.me/c/<id>/<msg>` where `<id>`
+    is the chat ID with the `-100` stripped. This link works for users
+    who are members of the channel.
+
+    If `FILES_CHANNEL_USERNAME` is set in env (e.g. `mhrv_files`), uses
+    the public-channel form `https://t.me/<username>/<msg>` instead,
+    which is clickable for everyone."""
+    username = os.environ.get("FILES_CHANNEL_USERNAME", "").strip().lstrip("@")
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    cid = chat_id
+    if cid.startswith("-100"):
+        cid = cid[4:]
+    elif cid.startswith("-"):
+        cid = cid[1:]
+    return f"https://t.me/c/{cid}/{message_id}"
+
+
+def post_main_channel_pointer(
+    bot_token: str,
+    main_chat_id: str,
+    files_channel_link: str,
+    version: str,
+    hashtag: str,
+) -> bool:
+    """Post a short cross-link to the main announcement channel pointing
+    at the anchor post in the files channel. Replaces the previous
+    behaviour of posting the universal APK + full changelog directly
+    to the main channel — the main channel becomes a discovery surface
+    while the files channel hosts the actual artifacts.
+    """
+    text = (
+        f"<b>📦 mhrv-rs v{html_escape(version)} منتشر شد</b>\n"
+        f"\nبرای دانلود فایل‌ها (Android، Windows، macOS، Linux و ...) "
+        f"به کانال فایل‌ها مراجعه کنید:\n"
+        f"\n👉 <a href=\"{html_escape(files_channel_link)}\">"
+        f"v{html_escape(version)} — همه فایل‌ها + SHA-256</a>\n"
+        f"\n{hashtag}"
+    )
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": main_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "false",
+    }).encode()
+    print(f"  posting cross-link to main channel {main_chat_id}...", flush=True)
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, data=data, method="POST"), timeout=30
+        ) as resp:
+            r = json.loads(resp.read().decode("utf-8"))
+            if not r.get("ok"):
+                print(f"    !! main-channel post failed: {r}", flush=True)
+                return False
+            print(
+                f"    ok (message_id={r['result']['message_id']})", flush=True
+            )
+            return True
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"    !! HTTP {e.code}: {err_body}", flush=True)
+        return False
+    except Exception as e:
+        print(f"    !! exception: {e}", flush=True)
+        return False
 
 
 def main() -> int:
@@ -315,15 +420,18 @@ def main() -> int:
         print(f"  - {f.name}")
     print()
 
-    # Optional: a leading announcement message that anchors the file
-    # batch. Posted as a regular sendMessage so it shows above the file
-    # group in the channel and gives recipients a single hashtag link
-    # to find this release later.
+    # Leading announcement in the files channel. Captured `message_id`
+    # is the anchor that the main-channel cross-link points at — the
+    # main channel doesn't carry files anymore, just a single message
+    # saying "new release, click here." Recipients land on this anchor
+    # and scroll down to see all the platform-specific files.
     announce = (
         f"<b>📦 mhrv-rs {html_escape('v' + args.version)} منتشر شد</b>\n"
         f"\nفایل‌ها در ادامه به ترتیب پلتفرم ارسال می‌شن.\n"
+        f"هر فایل با SHA-256 (تایید اصالت) همراه هست.\n"
         f"\n{args.hashtag}"
     )
+    announce_msg_id: int | None = None
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         data = urllib.parse.urlencode({
@@ -339,9 +447,15 @@ def main() -> int:
             if not r.get("ok"):
                 print(f"  !! announcement failed: {r}", flush=True)
             else:
-                print(f"  announcement posted (message_id={r['result']['message_id']})", flush=True)
+                announce_msg_id = r["result"]["message_id"]
+                print(
+                    f"  announcement posted (message_id={announce_msg_id})",
+                    flush=True,
+                )
     except Exception as e:
-        # Non-fatal: continue with file uploads even if announcement bombs.
+        # Non-fatal for the file uploads, but cross-link to the main
+        # channel below will be skipped — without the anchor message_id
+        # there's nothing to point at.
         print(f"  !! announcement exception: {e}", flush=True)
     time.sleep(INTER_UPLOAD_SLEEP_SECS)
 
@@ -351,6 +465,32 @@ def main() -> int:
         ok = post_file(bot_token, chat_id, f, base, args.hashtag)
         if not ok:
             failures += 1
+
+    # Cross-link to the main announcement channel. Skipped if MAIN_CHAT_ID
+    # is unset (development / private testing) or if the files-channel
+    # announcement didn't post (no anchor to link to).
+    main_chat_id = os.environ.get("MAIN_CHAT_ID", "").strip()
+    if main_chat_id and announce_msg_id is not None:
+        link = files_channel_post_link(chat_id, announce_msg_id)
+        print()
+        print(f"posting cross-link to main channel:")
+        print(f"  link: {link}")
+        ok = post_main_channel_pointer(
+            bot_token, main_chat_id, link, args.version, args.hashtag
+        )
+        if not ok:
+            failures += 1
+    elif main_chat_id and announce_msg_id is None:
+        print()
+        print(
+            "  !! MAIN_CHAT_ID is set but announcement message_id is None — "
+            "skipping cross-link (no anchor to point at).",
+            flush=True,
+        )
+        failures += 1
+    else:
+        print()
+        print("  MAIN_CHAT_ID not set, skipping cross-link", flush=True)
 
     print()
     if failures:
