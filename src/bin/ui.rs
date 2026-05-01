@@ -15,7 +15,11 @@ use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
+use mhrv_rs::system_proxy;
 use mhrv_rs::{scan_ips, scan_sni, test_cmd};
+
+#[cfg(not(target_os = "android"))]
+use mhrv_rs::tun_mode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WIN_WIDTH: f32 = 520.0;
@@ -153,6 +157,11 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    /// Whether the system proxy was automatically set on this Start.
+    /// Used to know whether we should clear it on Stop.
+    system_proxy_was_set: bool,
+    /// Whether TUN mode is currently active.
+    tun_active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -169,13 +178,21 @@ enum SniProbeState {
 }
 
 enum Cmd {
-    Start(Config),
+    Start {
+        config: Config,
+        auto_system_proxy: bool,
+        tun_mode: bool,
+    },
     Stop,
     Test(Config),
     InstallCa,
     RemoveCa,
     CheckCaTrusted,
     PollStats,
+    /// Set the OS system proxy to the given HTTP port + SOCKS5 port.
+    SetSystemProxy { http_port: u16, socks5_port: u16, host: String },
+    /// Clear the OS system proxy settings.
+    ClearSystemProxy,
     /// Probe a single SNI against the given google_ip. Result is written
     /// into UiState::sni_probe keyed by the SNI string.
     TestSni {
@@ -280,6 +297,17 @@ struct FormState {
     auto_blacklist_window_secs: u64,
     auto_blacklist_cooldown_secs: u64,
     request_timeout_secs: u64,
+    /// When `true`, mhrv-rs automatically sets the OS system proxy to
+    /// `listen_host:listen_port` (HTTP) and the SOCKS5 port on Start, and
+    /// clears it again on Stop. Persisted in the UI state only — not written
+    /// to `config.json` because it is a per-session runtime preference rather
+    /// than a connection parameter.
+    auto_system_proxy: bool,
+    /// When `true`, mhrv-rs starts a TUN-mode VPN that routes ALL traffic
+    /// through the SOCKS5 proxy (not just apps that honour the system proxy).
+    /// Requires administrator / root privileges and — on Windows — wintun.dll
+    /// to be present alongside the binary.
+    tun_mode_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -381,6 +409,8 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            auto_system_proxy: false,
+            tun_mode_enabled: false,
         }
     } else {
         FormState {
@@ -419,6 +449,8 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: 30,
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
+            auto_system_proxy: false,
+            tun_mode_enabled: false,
         }
     };
     (form, load_err)
@@ -806,7 +838,10 @@ impl eframe::App for App {
                 .show(ui, |ui| {
 
             // ── Header row: project name, version (→ github), status pill ─
-            let running = self.shared.state.lock().unwrap().running;
+            let (running, tun_active) = {
+                let s = self.shared.state.lock().unwrap();
+                (s.running, s.tun_active)
+            };
             ui.horizontal(|ui| {
                 ui.hyperlink_to(
                     egui::RichText::new("mhrv-rs").size(20.0).strong(),
@@ -854,6 +889,23 @@ impl eframe::App for App {
                                 );
                             });
                         });
+                    // TUN mode status badge — shown to the left of the running pill.
+                    if tun_active {
+                        ui.add_space(6.0);
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(20, 50, 80))
+                            .rounding(12.0)
+                            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("TUN")
+                                        .color(egui::Color32::from_rgb(100, 180, 240))
+                                        .monospace()
+                                        .strong()
+                                        .small(),
+                                );
+                            });
+                    }
                 });
             });
 
@@ -1022,6 +1074,66 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("SOCKS5").small());
                     ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port).desired_width(70.0));
                 });
+
+                // ── System-proxy & TUN mode toggles ───────────────────────
+                ui.add_space(4.0);
+
+                let sp_supported = system_proxy::is_supported();
+                ui.horizontal(|ui| {
+                    ui.add_space(120.0 + 8.0);
+                    ui.add_enabled_ui(sp_supported, |ui| {
+                        ui.checkbox(&mut self.form.auto_system_proxy, "Auto-set system proxy on Start")
+                            .on_hover_text(if sp_supported {
+                                "When checked, mhrv-rs automatically configures the OS HTTP/HTTPS and \
+                                 SOCKS5 system proxy when you click Start, and clears it on Stop. \
+                                 Apps that honour the OS proxy (Chrome, Edge, curl, …) will use the \
+                                 tunnel without any manual configuration."
+                            } else {
+                                "System proxy auto-set is not available on this platform."
+                            });
+                    });
+                });
+
+                // TUN mode — available on all non-Android desktop builds.
+                #[cfg(not(target_os = "android"))]
+                {
+                    let elevated = tun_mode::is_elevated();
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.tun_mode_enabled, "TUN mode (routes ALL traffic through proxy)")
+                            .on_hover_text(
+                                "Creates a virtual TUN network adapter that captures every application's \
+                                 traffic — not just those that honour the system proxy. \
+                                 Requires administrator / root privileges.\n\n\
+                                 Windows: wintun.dll must be present in the same folder as the binary \
+                                 (download from https://www.wintun.net/).\n\n\
+                                 Note: when TUN mode is active, 'Auto-set system proxy' is redundant."
+                            );
+                    });
+                    if self.form.tun_mode_enabled && !elevated {
+                        ui.horizontal(|ui| {
+                            ui.add_space(120.0 + 8.0);
+                            ui.small(
+                                egui::RichText::new(
+                                    "⚠ TUN mode needs administrator / root privileges — restart as admin.",
+                                )
+                                .color(ERR_RED),
+                            );
+                        });
+                    }
+                    #[cfg(windows)]
+                    if self.form.tun_mode_enabled {
+                        ui.horizontal(|ui| {
+                            ui.add_space(120.0 + 8.0);
+                            ui.small(
+                                egui::RichText::new(
+                                    "ℹ Windows: wintun.dll must be in the same folder as this binary.",
+                                )
+                                .color(egui::Color32::from_gray(160)),
+                            );
+                        });
+                    }
+                }
             });
 
             // ── Section: Advanced (collapsed by default) ──────────────────
@@ -1341,7 +1453,11 @@ impl eframe::App for App {
                     if ui.add(btn).clicked() {
                         match self.form.to_config() {
                             Ok(cfg) => {
-                                let _ = self.cmd_tx.send(Cmd::Start(cfg));
+                                let _ = self.cmd_tx.send(Cmd::Start {
+                                    auto_system_proxy: self.form.auto_system_proxy,
+                                    tun_mode: self.form.tun_mode_enabled,
+                                    config: cfg,
+                                });
                             }
                             Err(e) => {
                                 self.toast = Some((format!("Cannot start: {}", e), Instant::now()));
@@ -1430,6 +1546,48 @@ impl eframe::App for App {
                 if ui.small_button("Check CA").clicked() {
                     let _ = self.cmd_tx.send(Cmd::CheckCaTrusted);
                 }
+
+                // Manual system proxy buttons — useful even without the
+                // Auto-set checkbox (e.g. user started the proxy earlier
+                // and wants to point the OS at it now).
+                if system_proxy::is_supported() {
+                    let sp_was_set = self.shared.state.lock().unwrap().system_proxy_was_set;
+                    if running && !sp_was_set {
+                        if ui.small_button("Set system proxy")
+                            .on_hover_text(
+                                "Point the OS HTTP/HTTPS and SOCKS5 system proxy at the running \
+                                 mhrv-rs proxy. Apps that honour system proxy settings will \
+                                 immediately start routing through the tunnel.",
+                            )
+                            .clicked()
+                        {
+                            if let (Ok(http_port), Ok(socks5_port)) = (
+                                self.form.listen_port.trim().parse::<u16>(),
+                                self.form.socks5_port.trim().parse::<u16>(),
+                            ) {
+                                let host = if self.form.listen_host.trim().is_empty() {
+                                    "127.0.0.1".to_string()
+                                } else {
+                                    self.form.listen_host.trim().to_string()
+                                };
+                                let _ = self.cmd_tx.send(Cmd::SetSystemProxy {
+                                    http_port,
+                                    socks5_port,
+                                    host,
+                                });
+                            }
+                        }
+                    }
+                    if sp_was_set {
+                        if ui.small_button("Clear system proxy")
+                            .on_hover_text("Remove the OS system proxy entry set by mhrv-rs.")
+                            .clicked()
+                        {
+                            let _ = self.cmd_tx.send(Cmd::ClearSystemProxy);
+                        }
+                    }
+                }
+
                 if ui.small_button("Check for updates")
                     .on_hover_text(
                         "Ask GitHub's Releases API for the latest tag and compare against this \
@@ -1933,6 +2091,10 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         tokio::sync::oneshot::Sender<()>,
     )> = None;
 
+    // Active TUN session — only present while TUN mode is running.
+    #[cfg(not(target_os = "android"))]
+    let mut tun_session: Option<tun_mode::TunSession> = None;
+
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Cmd::PollStats) => {
@@ -1951,7 +2113,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     });
                 }
             }
-            Ok(Cmd::Start(cfg)) => {
+            Ok(Cmd::Start { config: cfg, auto_system_proxy, tun_mode }) => {
                 if active.is_some() {
                     push_log(&shared, "[ui] already running");
                     continue;
@@ -2027,11 +2189,87 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 });
 
                 active = Some((handle, fronter_slot, shutdown_tx));
+
+                // Set OS system proxy after the proxy task is spawned (it
+                // binds its port asynchronously, but setting the proxy
+                // entry immediately is fine — apps that try to connect
+                // before the port is open will just retry).
+                if auto_system_proxy {
+                    let socks5_port = cfg.socks5_port.unwrap_or(cfg.listen_port + 1);
+                    match system_proxy::set_system_proxy(
+                        &cfg.listen_host,
+                        cfg.listen_port,
+                        &cfg.listen_host,
+                        socks5_port,
+                    ) {
+                        Ok(()) => {
+                            push_log(&shared, "[ui] system proxy set");
+                            shared.state.lock().unwrap().system_proxy_was_set = true;
+                        }
+                        Err(e) => push_log(
+                            &shared,
+                            &format!("[ui] set system proxy failed: {e}"),
+                        ),
+                    }
+                }
+
+                // TUN mode — create a virtual TUN adapter and route all
+                // traffic through our SOCKS5 proxy.
+                #[cfg(not(target_os = "android"))]
+                if tun_mode {
+                    let socks5_port = cfg.socks5_port.unwrap_or(cfg.listen_port + 1);
+                    let socks5_addr_str = format!("{}:{}", cfg.listen_host, socks5_port);
+                    match socks5_addr_str.parse() {
+                        Ok(socks5_addr) => {
+                            let bypass_ip = cfg.google_ip.parse::<std::net::IpAddr>().ok();
+                            let session = tun_mode::start_tun(socks5_addr, bypass_ip);
+                            tun_session = Some(session);
+                            shared.state.lock().unwrap().tun_active = true;
+                            push_log(
+                                &shared,
+                                &format!(
+                                    "[ui] TUN mode started → SOCKS5 {}",
+                                    socks5_addr_str
+                                ),
+                            );
+                        }
+                        Err(e) => push_log(
+                            &shared,
+                            &format!("[ui] TUN mode: invalid SOCKS5 addr '{socks5_addr_str}': {e}"),
+                        ),
+                    }
+                }
+                #[cfg(not(target_os = "android"))]
+                let _ = tun_mode; // suppress unused-variable warning when feature is disabled
             }
 
             Ok(Cmd::Stop) => {
                 if let Some((mut handle, _, shutdown_tx)) = active.take() {
                     push_log(&shared, "[ui] stop requested");
+
+                    // Stop TUN mode first so routing is restored before
+                    // we tear down the SOCKS5 proxy it was pointing at.
+                    #[cfg(not(target_os = "android"))]
+                    if let Some(session) = tun_session.take() {
+                        push_log(&shared, "[ui] stopping TUN mode...");
+                        rt.block_on(session.stop());
+                        shared.state.lock().unwrap().tun_active = false;
+                        push_log(&shared, "[ui] TUN mode stopped");
+                    }
+
+                    // Clear system proxy if we set it on Start.
+                    let was_set = shared.state.lock().unwrap().system_proxy_was_set;
+                    if was_set {
+                        match system_proxy::clear_system_proxy() {
+                            Ok(()) => push_log(&shared, "[ui] system proxy cleared"),
+                            Err(e) => push_log(
+                                &shared,
+                                &format!("[ui] clear system proxy failed: {e}"),
+                            ),
+                        }
+                        shared.state.lock().unwrap().system_proxy_was_set = false;
+                    }
+
                     let _ = shutdown_tx.send(());
 
                     // Give the proxy 2 seconds to shut down gracefully
@@ -2298,15 +2536,47 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     }
                 });
             }
+            Ok(Cmd::SetSystemProxy { http_port, socks5_port, host }) => {
+                match system_proxy::set_system_proxy(&host, http_port, &host, socks5_port) {
+                    Ok(()) => {
+                        push_log(&shared, "[ui] system proxy set");
+                        shared.state.lock().unwrap().system_proxy_was_set = true;
+                    }
+                    Err(e) => push_log(&shared, &format!("[ui] set system proxy failed: {e}")),
+                }
+            }
+            Ok(Cmd::ClearSystemProxy) => {
+                match system_proxy::clear_system_proxy() {
+                    Ok(()) => {
+                        push_log(&shared, "[ui] system proxy cleared");
+                        shared.state.lock().unwrap().system_proxy_was_set = false;
+                    }
+                    Err(e) => push_log(&shared, &format!("[ui] clear system proxy failed: {e}")),
+                }
+            }
             Err(_) => {}
         }
 
-        // Clean up finished task.
+        // Clean up finished proxy task.
         if let Some((handle, _, _)) = &active {
             if handle.is_finished() {
                 active = None;
                 shared.state.lock().unwrap().running = false;
                 shared.state.lock().unwrap().started_at = None;
+            }
+        }
+
+        // Clean up finished TUN task (self-exited, e.g. on error).
+        #[cfg(not(target_os = "android"))]
+        if let Some(ref session) = tun_session {
+            if session.handle.is_finished() {
+                tun_session = None;
+                let mut st = shared.state.lock().unwrap();
+                if st.tun_active {
+                    st.tun_active = false;
+                    drop(st);
+                    push_log(&shared, "[ui] TUN mode exited");
+                }
             }
         }
     }

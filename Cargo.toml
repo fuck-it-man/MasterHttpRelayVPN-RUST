@@ -96,6 +96,35 @@ libc = "0.2"
 jni = { version = "0.21", default-features = false }
 tun2proxy = { version = "0.7", default-features = false, features = ["udpgw"] }
 
+# Windows-only deps for the new system-proxy and TUN-mode features:
+#
+# winreg  — low-level Windows Registry access used by src/system_proxy.rs to
+#           set HKCU\...\Internet Settings\ProxyEnable/ProxyServer. The crate
+#           is already in the lock file as a transitive dep of wintun-bindings;
+#           adding it here just makes it an explicit, versioned direct dep.
+#
+# tun2proxy / tproxy-config — the same TUN-to-SOCKS5 bridge used on Android,
+#           but here driven from src/tun_mode.rs for the Windows desktop UI.
+#           On Windows tun2proxy uses the WinTun kernel driver (wintun.dll,
+#           which must be present at runtime — see the tun_mode module docs).
+#           tproxy-config is tun2proxy's sibling crate that exports IpCidr
+#           and the tproxy_setup/tproxy_remove helpers we call through
+#           general_run_async; listed explicitly so the type is in scope for
+#           our code without going through a private re-export path.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+tun2proxy = { version = "0.7", default-features = false }
+tproxy-config = "7.0.7"
+
+# macOS / Linux desktop TUN mode — same tun2proxy bridge, native TUN (no
+# wintun.dll needed). setup=true calls tproxy_setup which handles routing
+# via the platform's native route/pfctl/netsh tooling.
+#
+# Note: libc is already listed for all Unix above; no duplication here.
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+tun2proxy = { version = "0.7", default-features = false }
+tproxy-config = "7.0.7"
+
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.
 x509-parser = "0.16"
