@@ -2247,11 +2247,13 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tproxy-config",
  "tracing",
  "tracing-subscriber",
  "tun2proxy",
  "url",
  "webpki-roots 0.26.11",
+ "winreg",
  "x509-parser",
 ]
 
