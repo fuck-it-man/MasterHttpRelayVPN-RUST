@@ -1169,8 +1169,29 @@ impl DomainFronter {
         // Fan-out path: fire N instances in parallel, return first Ok, cancel
         // the rest. Clamps to number of available script IDs so the single-ID
         // case is a no-op even if parallel_relay>1 was configured.
+        //
+        // `select_ok` cancels the loser futures, but those futures only own
+        // the OUR-side I/O (TLS write, response read) — the Apps Script
+        // server has no idea the racing Rust task is gone, so every fan-out
+        // call still completes server-side and Apps Script's
+        // `UrlFetchApp.fetch()` to the destination still fires. For
+        // **non-idempotent** methods (POST / PUT / PATCH / DELETE) this
+        // surfaces as duplicate writes at the destination — a comment
+        // posted twice, a vote double-counted, a payment double-charged.
+        //
+        // Reported in #743: parallel_relay=2 + a POST to GitHub created
+        // two issue comments per submission. Same root cause as the
+        // SAFE_REPLAY_METHODS guard in Code.gs's `_doBatch` fallback —
+        // safe methods are idempotent, so re-firing is at worst wasteful;
+        // unsafe methods can have side effects, so re-firing is incorrect.
+        //
+        // Drop to sequential for non-idempotent methods regardless of
+        // `parallel_relay` setting. Users keep p95 wins on browsing /
+        // GET-heavy traffic (the common case) and don't lose correctness
+        // on form submits.
+        let method_safe_for_fanout = is_method_safe_for_fanout(method);
         let fan = self.parallel_relay.min(self.script_ids.len()).max(1);
-        if fan >= 2 {
+        if fan >= 2 && method_safe_for_fanout {
             return self.do_relay_parallel(method, url, headers, body, fan).await;
         }
 
@@ -2697,6 +2718,18 @@ fn parse_status_line(line: &str) -> Result<u16, FronterError> {
     code.parse::<u16>().map_err(|_| FronterError::BadResponse(format!("bad status code: {}", code)))
 }
 
+/// Returns `true` if the HTTP method is safe to fan-out across multiple
+/// Apps Script deployments (i.e. idempotent per RFC 9110 §9.2.2). Used
+/// by `do_relay_with_retry` to gate the `parallel_relay` fan-out so that
+/// non-idempotent operations (POST / PUT / PATCH / DELETE) don't double-
+/// fire at the destination — Apps Script `UrlFetchApp.fetch()` can't be
+/// cancelled mid-request from our side, so every parallel attempt
+/// completes server-side even when our `select_ok` already returned a
+/// winner. See #743 for the user-visible bug (duplicate POSTs).
+fn is_method_safe_for_fanout(method: &str) -> bool {
+    matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS")
+}
+
 /// Parse the JSON envelope from Apps Script and build a raw HTTP response.
 fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     let text = std::str::from_utf8(body)
@@ -3589,6 +3622,38 @@ hello";
     fn mask_script_id_hides_middle() {
         assert_eq!(mask_script_id("short"), "***");
         assert_eq!(mask_script_id("AKfycbx1234567890abcdef"), "AKfy...cdef");
+    }
+
+    #[test]
+    fn parallel_relay_only_safe_for_idempotent_methods() {
+        // Locks down #743: parallel_relay must never fan-out non-idempotent
+        // methods because Apps Script can't be cancelled mid-request, so
+        // every concurrent attempt completes server-side and side-effects
+        // duplicate at the destination (comment posted twice, etc.).
+        for safe in ["GET", "HEAD", "OPTIONS", "get", "head", "options"] {
+            assert!(
+                is_method_safe_for_fanout(safe),
+                "{} should be safe for fan-out (idempotent per RFC 9110)",
+                safe,
+            );
+        }
+        for unsafe_m in ["POST", "PUT", "PATCH", "DELETE", "post", "put", "patch", "delete"] {
+            assert!(
+                !is_method_safe_for_fanout(unsafe_m),
+                "{} must NOT be safe for fan-out (non-idempotent — duplicate side-effects)",
+                unsafe_m,
+            );
+        }
+        // Unknown methods (CONNECT, TRACE, custom verbs) default to NOT
+        // safe — conservative call, matches the upstream `UrlFetchApp`
+        // lookup behavior.
+        for unknown in ["CONNECT", "TRACE", "PROPFIND", ""] {
+            assert!(
+                !is_method_safe_for_fanout(unknown),
+                "{} must default to NOT safe for fan-out when unrecognised",
+                unknown,
+            );
+        }
     }
 
     #[test]
